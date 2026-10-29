@@ -256,6 +256,16 @@ func (h *FileWSHandler) FileUploadChunkBinary(c *pkgapp.WebsocketClient, data []
 	binarySession := c.Server.GetSession(c.User.ID, sessionID)
 
 	if binarySession == nil {
+		// Late or duplicate chunk for an upload that already completed: answer like the isCompleted
+		// branch below, and release the plugin slot that may still be held for this path (once)
+		// 已完成上传的迟到/重复分片：按下方 isCompleted 分支处理，并释放插件可能仍为该路径持有的槽位（仅一次）
+		if ts, found, first := c.Server.TakeUploadTombstone(c.User.ID, sessionID); found {
+			if first {
+				sendSlotReleaseHint(c, ts.Vault, c.LatestRoundContext(""), ts.Path)
+			}
+			c.ToResponse(code.Success)
+			return
+		}
 		h.logError(c, "websocket_router.file.FileUploadChunkBinary", fmt.Errorf("session not found: %s", sessionID))
 		c.ToResponse(code.ErrorFileUploadSessionNotFound.WithData(map[string]string{
 			"sessionID": sessionID,
@@ -406,6 +416,7 @@ func (h *FileWSHandler) FileUploadChunkBinary(c *pkgapp.WebsocketClient, data []
 			Path:     session.Path,
 			PathHash: session.PathHash,
 		}).WithVault(session.Vault).WithContext(session.Context), string(FileUploadAck))
+		sendStaleAckSlotReleaseHint(c, session.Vault, session.Context, session.Path)
 
 		// Mark as completed and remove from global server
 		// 标记为已完成并从全局服务器移除
@@ -413,6 +424,11 @@ func (h *FileWSHandler) FileUploadChunkBinary(c *pkgapp.WebsocketClient, data []
 		session.isCompleted = true
 		session.mu.Unlock()
 		c.Server.RemoveSession(c.User.ID, session.ID)
+		c.Server.AddUploadTombstone(c.User.ID, session.ID, pkgapp.UploadTombstone{
+			Vault:    session.Vault,
+			Path:     session.Path,
+			PathHash: session.PathHash,
+		})
 
 		// Broadcast file update message (only when fileSvc is available)
 		// 广播文件更新消息（仅在 fileSvc 可用时）
@@ -1073,6 +1089,10 @@ func (h *FileWSHandler) doFileSync(c *pkgapp.WebsocketClient, params *dto.FileSy
 			}
 		}
 	}
+
+	// Release plugin slots that may have leaked for keys this round re-requests (see ws_slot_hint.go)
+	// 释放插件可能为本轮再次请求的键泄漏的槽位（见 ws_slot_hint.go）
+	sendRoundSlotReleaseHints(c, params.Vault, params.Context, messageQueue)
 
 	// Send FileSyncEnd message
 	// 发送 FileSyncEnd 消息

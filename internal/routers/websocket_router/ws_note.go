@@ -125,6 +125,7 @@ func (h *NoteWSHandler) NoteModify(c *pkgapp.WebsocketClient, msg *pkgapp.WebSoc
 					Path:     params.Path,
 					PathHash: params.PathHash,
 				}).WithVault(params.Vault).WithContext(params.Context), string(NoteModifyAck))
+				sendStaleAckSlotReleaseHint(c, params.Vault, params.Context, params.Path)
 				return
 			}
 
@@ -420,6 +421,7 @@ func (h *NoteWSHandler) NoteModify(c *pkgapp.WebsocketClient, msg *pkgapp.WebSoc
 			Path:     note.Path,
 			PathHash: note.PathHash,
 		}).WithVault(params.Vault).WithContext(params.Context), string(NoteModifyAck))
+		sendStaleAckSlotReleaseHint(c, params.Vault, params.Context, note.Path)
 		c.BroadcastResponse(code.Success.WithData(
 			dto.NoteSyncModifyMessage{
 				Path:             note.Path,
@@ -454,6 +456,7 @@ func (h *NoteWSHandler) NoteModify(c *pkgapp.WebsocketClient, msg *pkgapp.WebSoc
 				Path:     params.Path,
 				PathHash: params.PathHash,
 			}).WithVault(params.Vault).WithContext(params.Context), string(NoteModifyAck))
+			sendStaleAckSlotReleaseHint(c, params.Vault, params.Context, params.Path)
 		} else {
 			c.ToResponse(code.SuccessNoUpdate.WithVault(params.Vault).WithContext(params.Context))
 		}
@@ -1162,6 +1165,10 @@ func (h *NoteWSHandler) doNoteSync(c *pkgapp.WebsocketClient, params *dto.NoteSy
 	}
 
 	c.IsFirstSync = true
+
+	// Release plugin slots that may have leaked for keys this round re-requests (see ws_slot_hint.go)
+	// 释放插件可能为本轮再次请求的键泄漏的槽位（见 ws_slot_hint.go）
+	sendRoundSlotReleaseHints(c, params.Vault, params.Context, messageQueue)
 
 	// Send NoteSyncEnd message, containing all counts
 	// 发送 NoteSyncEnd 消息，包含所有统计计数

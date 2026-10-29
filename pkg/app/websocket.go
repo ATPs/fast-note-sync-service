@@ -312,6 +312,7 @@ type WebsocketClient struct {
 	trans         ut.Translator // Validation translator from lang middleware // 语言中间件设置的校验翻译器
 	authDone      chan struct{} // Closed when Authorization finishes (success or failure) // Authorization 结束（成功或失败）时关闭
 	authDoneOnce  sync.Once
+	slotHint      slotHintState // Sync round tracking for plugin slot-release hints // 插件槽位释放提示所需的同步轮次跟踪
 }
 
 // markAuthDone signals that Authorization has finished.
@@ -969,6 +970,7 @@ type WebsocketServer struct {
 	EnvelopeDecoder     func(data []byte) (string, []byte, error)               // Protobuf envelope decoder // Protobuf 信封解包钩子
 	ProtobufDecoder     func(action string, data []byte, obj any) (bool, error) // Protobuf decoder hook // Protobuf 解码钩子
 	ProtobufEncoder     func(action string, res *Res) ([]byte, error)           // Protobuf encoder hook // Protobuf 编码钩子
+	slotHint            slotHintServerState                                     // Plugin slot-release hint state // 插件槽位释放提示状态
 }
 
 // WSClientInfo WebSocket client information for API responses
@@ -1705,6 +1707,7 @@ func (w *WebsocketServer) OnClose(conn *gws.Conn, err error) {
 		}
 		log(logLevel, "WS User Leave", zap.String("uid", c.User.ID), zap.String("traceID", c.TraceID), zap.Error(err))
 		w.RemoveUserClient(c)
+		w.markVaultClosed(c)
 	} else {
 		logLevel := LogInfo
 		if err != nil && !isNormalDisconnectError(err) {
