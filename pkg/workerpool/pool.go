@@ -7,6 +7,8 @@ package workerpool
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -177,7 +179,7 @@ func (p *Pool) executeTask(task taskWrapper) {
 	case <-task.ctx.Done():
 		err = ErrTaskCancelled
 	default:
-		err = task.fn(task.ctx)
+		err = p.runTask(task)
 	}
 
 	// Send results
@@ -190,6 +192,20 @@ func (p *Pool) executeTask(task taskWrapper) {
 			// done channel 已关闭或已满，忽略
 		}
 	}
+}
+
+// runTask runs the task function, converting a panic into an error so one bad task cannot crash the process
+// runTask 执行任务函数，将 panic 转换为错误，避免单个异常任务导致进程崩溃
+func (p *Pool) runTask(task taskWrapper) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.logger.Error("worker pool task panic",
+				zap.Any("panic", r),
+				zap.ByteString("stack", debug.Stack()))
+			err = fmt.Errorf("task panic: %v", r)
+		}
+	}()
+	return task.fn(task.ctx)
 }
 
 // checkWarningThreshold checks if approaching capacity

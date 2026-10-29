@@ -37,6 +37,10 @@ const (
 	LogDebug       LogType = "debug"
 )
 
+// binaryAuthWait max wait for an in-flight Authorization before rejecting a binary frame
+// binaryAuthWait 拒绝二进制帧前等待进行中 Authorization 的最长时间
+const binaryAuthWait = 10 * time.Second
+
 // traceIDKeyType used to store Trace ID in context
 // traceIDKeyType 用于在 context 中存储 Trace ID
 type traceIDKeyType struct{}
@@ -300,6 +304,63 @@ type WebsocketClient struct {
 	PbEnabled           bool                      // Client's local protobufEnabled setting, from URL query "pb" (1/0); only meaningful when ProtoVersion>=2 // 客户端本地 protobufEnabled 设置，来自 URL query "pb"（1/0）；仅在 ProtoVersion>=2 时有意义
 	currentAction       string                    // Current action type being processed // Current action type being processed // 当前正在处理的动作类型
 	remoteAddr          string                    // Client real IP address, extracted from HTTP headers / 客户端真实 IP 地址，从 HTTP 头部提取
+	// Handshake metadata snapshotted at upgrade time. Ctx is a pooled *gin.Context that gin recycles
+	// for other requests once the upgrade handler returns, so it must not be read after the handshake.
+	// 升级时快照的握手元数据。Ctx 是 gin 池化的 *gin.Context，升级处理函数返回后会被其他请求复用，握手后不可再读取。
+	reqClientType string        // x-client header or "client" query // x-client 头或 client 查询参数
+	reqUserAgent  string        // User-Agent header // User-Agent 头
+	trans         ut.Translator // Validation translator from lang middleware // 语言中间件设置的校验翻译器
+	authDone      chan struct{} // Closed when Authorization finishes (success or failure) // Authorization 结束（成功或失败）时关闭
+	authDoneOnce  sync.Once
+}
+
+// markAuthDone signals that Authorization has finished.
+// markAuthDone 标记 Authorization 已结束。
+func (c *WebsocketClient) markAuthDone() {
+	c.authDoneOnce.Do(func() { close(c.authDone) })
+}
+
+// waitAuth waits up to timeout for Authorization to finish and reports whether the client is authenticated.
+// Binary frames skip the interceptors and may be dispatched in parallel with an in-flight Authorization.
+// waitAuth 最多等待 timeout 直到 Authorization 结束，返回客户端是否已认证。
+// 二进制帧不经过拦截器，且可能与正在进行的 Authorization 并行分发。
+func (c *WebsocketClient) waitAuth(ctx context.Context, timeout time.Duration) bool {
+	if c.authDone != nil {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-c.authDone:
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+	}
+	return c.User != nil
+}
+
+// uid returns the authenticated user ID, or "Guest" for unauthenticated connections.
+// uid 返回已认证用户 ID，未认证连接返回 "Guest"。
+func (c *WebsocketClient) uid() string {
+	if c.User != nil {
+		return c.User.ID
+	}
+	return "Guest"
+}
+
+// translateValidationErrors converts validator errors into ValidErrors, falling back to raw messages without a translator.
+// translateValidationErrors 将校验错误转换为 ValidErrors，无翻译器时退回原始错误信息。
+func (c *WebsocketClient) translateValidationErrors(validationErrors validatorV10.ValidationErrors) ValidErrors {
+	var errs ValidErrors
+	for _, validationErr := range validationErrors {
+		msg := validationErr.Error()
+		if c.trans != nil {
+			msg = validationErr.Translate(c.trans)
+		}
+		errs = append(errs, &ValidError{
+			Key:     validationErr.Field(),
+			Message: msg,
+		})
+	}
+	return errs
 }
 
 // ClientName returns the client-reported name (e.g. "Mac", "Windows", "iPhone").
@@ -492,15 +553,7 @@ func (c *WebsocketClient) BindAndValidWithAction(action string, data []byte, obj
 			}
 			if err := validator.ValidateStruct(obj); err != nil {
 				if validationErrors, ok := err.(validatorV10.ValidationErrors); ok {
-					v := c.Ctx.Value("trans")
-					trans := v.(ut.Translator)
-					for _, validationErr := range validationErrors {
-						translatedMsg := validationErr.Translate(trans)
-						errs = append(errs, &ValidError{
-							Key:     validationErr.Field(),
-							Message: translatedMsg,
-						})
-					}
+					errs = append(errs, c.translateValidationErrors(validationErrors)...)
 				}
 				return false, errs
 			}
@@ -530,22 +583,9 @@ func (c *WebsocketClient) BindAndValidWithAction(action string, data []byte, obj
 		// If verification fails, check error type
 		// 如果验证失败，检查错误类型
 		if validationErrors, ok := err.(validatorV10.ValidationErrors); ok {
-			// Get translator
-			// 获取翻译器
-			v := c.Ctx.Value("trans")
-			trans := v.(ut.Translator)
-
-			// Iterate through validation errors and translate them
-			// 遍历验证错误并进行翻译
-			for _, validationErr := range validationErrors {
-				translatedMsg := validationErr.Translate(trans) // Translate error message
-				// Translate error message
-				// 翻译错误消息
-				errs = append(errs, &ValidError{
-					Key:     validationErr.Field(),
-					Message: translatedMsg,
-				})
-			}
+			// Translate with the translator snapshotted at handshake time
+			// 使用握手时快照的翻译器翻译错误消息
+			errs = append(errs, c.translateValidationErrors(validationErrors)...)
 		}
 		return false, errs // Return validation error
 		// 返回验证错误
@@ -1086,6 +1126,18 @@ func (w *WebsocketServer) Run() gin.HandlerFunc {
 		client.clientVersion = c.Query("clientVersion")
 		client.Protocol = c.Query("protocol")
 
+		// Snapshot handshake metadata now: c is returned to gin's pool when this handler returns
+		// 立即快照握手元数据：本处理函数返回后 c 会被放回 gin 的对象池
+		client.reqClientType = c.GetHeader("x-client")
+		if client.reqClientType == "" {
+			client.reqClientType = client.clientType
+		}
+		client.reqUserAgent = c.GetHeader("User-Agent")
+		if v, ok := c.Get("trans"); ok {
+			client.trans, _ = v.(ut.Translator)
+		}
+		client.authDone = make(chan struct{})
+
 		// v2 handshake capability declaration (§2.2): pv = protocol version the client
 		// supports, pb = client's local protobufEnabled setting. Missing/invalid values
 		// leave ProtoVersion at its zero value, which downstream negotiation logic treats
@@ -1161,6 +1213,9 @@ func (w *WebsocketServer) UseBinary(prefix string, handler func(*WebsocketClient
 }
 
 func (w *WebsocketServer) Authorization(c *WebsocketClient, msg *WebSocketMessage) {
+	// Release binary frames waiting in waitAuth once authorization finishes either way
+	// 无论成功与否，Authorization 结束后释放在 waitAuth 中等待的二进制帧
+	defer c.markAuthDone()
 
 	secretKey := w.app.GetAuthTokenKey()
 	if user, err := ParseTokenWithKey(string(msg.Data), secretKey); err != nil {
@@ -1186,14 +1241,9 @@ func (w *WebsocketServer) Authorization(c *WebsocketClient, msg *WebSocketMessag
 		// Verify 3D RBAC permissions via injected handler
 		// 通过注入的处理函数验证 3D RBAC 权限
 		if w.tokenVerifyHandler != nil {
-			reqClientType := c.Ctx.GetHeader("x-client")
-			if reqClientType == "" {
-				reqClientType = c.Ctx.Query("client")
-			}
-			reqUserAgent := c.Ctx.GetHeader("User-Agent")
-			reqIP := c.Ctx.ClientIP()
-
-			scope, vaults, err := w.tokenVerifyHandler(c.Context(), uid, user.TokenID, user.Nonce, reqClientType, c.ClientName(), c.ClientVersion(), reqUserAgent, reqIP)
+			// Use handshake metadata snapshotted at upgrade; c.Ctx may already serve another request
+			// 使用升级时快照的握手元数据；c.Ctx 此时可能已在服务其他请求
+			scope, vaults, err := w.tokenVerifyHandler(c.Context(), uid, user.TokenID, user.Nonce, c.reqClientType, c.ClientName(), c.ClientVersion(), c.reqUserAgent, c.remoteAddr)
 			if err != nil {
 				log(LogError, "WS Authorization FAILD: Token verify failed", zap.Error(err))
 				if appErr, ok := err.(*code.Code); ok {
@@ -1719,7 +1769,7 @@ func (w *WebsocketServer) OnMessage(conn *gws.Conn, message *gws.Message) {
 	if message.Opcode == gws.OpcodeBinary {
 		data := message.Data.Bytes()
 		if len(data) < 2 {
-			log(LogError, "WS OnMessage Binary too short", zap.String("uid", c.User.ID))
+			log(LogError, "WS OnMessage Binary too short", zap.String("uid", c.uid()))
 			return
 		}
 		prefix := string(data[:2])
@@ -1741,9 +1791,22 @@ func (w *WebsocketServer) OnMessage(conn *gws.Conn, message *gws.Message) {
 					return ctx.Err()
 				default:
 				}
+				// Binary frames bypass the interceptors: a reconnecting client may resume chunk uploads
+				// before its Authorization finishes, so wait for it and reject if still unauthenticated
+				// 二进制帧不经过拦截器：重连的客户端可能在 Authorization 完成前就恢复分块上传，
+				// 因此等待其完成，仍未认证则拒绝
+				if !c.waitAuth(ctx, binaryAuthWait) {
+					log(LogWarn, "WS OnMessage Binary on unauthenticated connection", zap.String("prefix", prefix), zap.String("traceID", c.TraceID))
+					resp := code.ErrorNotUserAuthToken
+					if len(payloadCopy) >= 36 {
+						resp = resp.WithData(map[string]string{"sessionID": string(payloadCopy[:36])})
+					}
+					c.ToResponse(resp)
+					return nil
+				}
 				// Verify binary message permission (currently only "00" for file chunk upload)
 				if !VerifyPermissions(c.Scope, "ws", c.ClientType(), "file_w") {
-					log(LogWarn, "WS OnMessage Binary Permission Denied", zap.String("prefix", prefix), zap.String("uid", c.User.ID))
+					log(LogWarn, "WS OnMessage Binary Permission Denied", zap.String("prefix", prefix), zap.String("uid", c.uid()))
 					c.ToResponse(code.ErrorAuthTokenScopeRestricted.WithDetails("Permission denied: binary " + prefix))
 					return nil
 				}
@@ -1755,24 +1818,24 @@ func (w *WebsocketServer) OnMessage(conn *gws.Conn, message *gws.Message) {
 				// Worker Pool 满载或已关闭，记录错误并返回错误响应
 				log(LogError, "WS OnMessage Worker Pool error",
 					zap.String("prefix", prefix),
-					zap.String("uid", c.User.ID),
+					zap.String("uid", c.uid()),
 					zap.Error(err))
 				c.ToResponse(code.ErrorServerBusy)
 				return
 			}
 		} else if prefix == "pb" {
 			if !c.UseProtobuf() {
-				log(LogWarn, "WS OnMessage received Protobuf but UseProtobuf is false", zap.String("uid", c.User.ID))
+				log(LogWarn, "WS OnMessage received Protobuf but UseProtobuf is false", zap.String("uid", c.uid()))
 				return
 			}
 			if w.EnvelopeDecoder == nil {
-				log(LogError, "WS OnMessage EnvelopeDecoder is nil", zap.String("uid", c.User.ID))
+				log(LogError, "WS OnMessage EnvelopeDecoder is nil", zap.String("uid", c.uid()))
 				return
 			}
 
 			action, innerPayload, err := w.EnvelopeDecoder(payloadCopy)
 			if err != nil {
-				log(LogError, "WS OnMessage Protobuf Envelope decode failed", zap.Error(err), zap.String("uid", c.User.ID))
+				log(LogError, "WS OnMessage Protobuf Envelope decode failed", zap.Error(err), zap.String("uid", c.uid()))
 				return
 			}
 
@@ -1821,7 +1884,7 @@ func (w *WebsocketServer) OnMessage(conn *gws.Conn, message *gws.Message) {
 		msg.Type = messageStr[:index]           // Extract the part before the separator // 提取分隔符之前的部分
 		msg.Data = []byte(messageStr[index+1:]) // Extract the part after the separator // 提取分隔符之后的部分
 	} else {
-		log(LogError, "WS OnMessage", zap.String("type", "Illegal message type"), zap.String("uid", c.User.ID))
+		log(LogError, "WS OnMessage", zap.String("type", "Illegal message type"), zap.String("uid", c.uid()))
 		return
 	}
 

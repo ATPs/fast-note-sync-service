@@ -224,6 +224,14 @@ func (h *FileWSHandler) FileUploadChunkBinary(c *pkgapp.WebsocketClient, data []
 	default:
 	}
 
+	// Reject chunks on unauthenticated connections (upload sessions are keyed by user)
+	// 拒绝未认证连接上的分块（上传会话按用户索引）
+	if c.User == nil {
+		h.logWarn(c, "FileUploadChunkBinary: unauthenticated connection")
+		c.ToResponse(code.ErrorNotUserAuthToken)
+		return
+	}
+
 	// Verify permissions (file_w scope required for file chunk upload)
 	// 校验权限 (文件分块上传需要拥有 file_w 权限范围)
 	if !pkgapp.VerifyPermissions(c.Scope, "ws", c.ClientType(), "file_w") {
